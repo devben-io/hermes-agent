@@ -839,9 +839,16 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
-        to the poll loop. On reconnect, per-channel `since` filters resume
-        from the last observed timestamps (same-second overlap de-duped by
-        event id)."""
+        to the poll loop.
+
+        CLOSED event handling:
+        - "not a channel member" → catalog event: drop the dead channel from
+          _channel_state and keep other subscriptions alive (no reconnect)
+        - All other CLOSED → transport/auth error: full reconnect with backoff
+
+        On reconnect, channel state is reconciled against a fresh
+        `channels list` to pick up new/removed channels, then per-channel
+        `since` filters resume from last observed timestamps."""
         import websockets
 
         backoff = 1.0
@@ -884,7 +891,48 @@ class BuzzAdapter(BasePlatformAdapter):
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
                             elif message[0] == "CLOSED":
+                                # Per-subscription CLOSED handling
+                                subscription_id = str(message[1]) if len(message) > 1 else ""
                                 detail = message[-1] if len(message) > 2 else "subscription closed"
+                                
+                                # Extract channel info for logging
+                                channel_id = subscriptions.get(subscription_id, "")
+                                channel_name = self._channel_names.get(channel_id) if channel_id else channel_id[:8] if channel_id else "unknown"
+                                
+                                # Catalog change: channel deleted/archived → drop and continue
+                                if "not a channel member" in detail.lower():
+                                    if channel_id and channel_id in self._channel_state:
+                                        logger.warning(
+                                            "Buzz: channel %s (%s) removed (subscription %s): %s - "
+                                            "dropping from watch list, other subscriptions continue",
+                                            channel_name,
+                                            channel_id[:8],
+                                            subscription_id,
+                                            detail
+                                        )
+                                        del self._channel_state[channel_id]
+                                        self._channel_names.pop(channel_id, None)
+                                        self._channel_meta.pop(channel_id, None)
+                                        subscriptions.pop(subscription_id, None)
+                                        continue
+                                    else:
+                                        # Channel not in state - stale subscription, just drop it
+                                        logger.debug(
+                                            "Buzz: dropping stale subscription %s (channel %s not in state): %s",
+                                            subscription_id,
+                                            channel_id[:8] if channel_id else "unknown",
+                                            detail
+                                        )
+                                        subscriptions.pop(subscription_id, None)
+                                        continue
+                                
+                                # Other CLOSED reasons are fatal - reconnect
+                                logger.warning(
+                                    "Buzz: subscription %s closed (channel %s): %s - reconnecting",
+                                    subscription_id,
+                                    channel_name,
+                                    detail
+                                )
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
@@ -893,10 +941,60 @@ class BuzzAdapter(BasePlatformAdapter):
                 except Exception as e:
                     self._ws_active = False
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
+                    # Re-run channel discovery on reconnect to pick up changes
+                    try:
+                        await self._rediscover_channels()
+                    except Exception as rediscovery_error:
+                        logger.debug(
+                            "Buzz: channel rediscovery failed during reconnect: %s",
+                            rediscovery_error,
+                            exc_info=True
+                        )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+
+    async def _rediscover_channels(self) -> None:
+        """Re-run channel discovery and update _channel_state without disrupting
+        active subscriptions. Called during reconnect to pick up new/removed channels.
+
+        This is a lightweight version of connect()'s discovery - it updates the
+        channel metadata and adds new channels, but doesn't disrupt existing state
+        for channels that are still in the watch list.
+        """
+        try:
+            # Refresh channel list and metadata
+            code, out, err = await self._run_cli(["channels", "list"])
+            if code != 0:
+                logger.debug("Buzz: channel list fetch failed during rediscovery: %s", _cli_error_message(err, code))
+                return
+            
+            listed = _parse_json_list(out)
+            # Update names/metadata
+            for ch in listed:
+                ch_id = str(ch.get("channel_id") or "")
+                if not ch_id:
+                    continue
+                self._channel_meta[ch_id] = ch
+                self._channel_names[ch_id] = str(ch.get("name") or ch_id)
+            
+            # Determine new channels to add
+            current_watch = self.channels or list(self._channel_names)
+            new_channels = [ch for ch in current_watch if ch not in self._channel_state]
+            
+            # Seed new channels
+            for channel_id in new_channels:
+                if channel_id not in self._channel_state:
+                    # Default to group type; DM discovery will reclassify later
+                    await self._seed_channel(channel_id, chat_type="group")
+                    logger.info("Buzz: added new channel %s during rediscovery", channel_id)
+            
+            # Refresh DM discovery for any new direct messages
+            await self._discover_dms(seed=False)
+            
+        except Exception:
+            logger.debug("Buzz: channel rediscovery encountered an error", exc_info=True)
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
