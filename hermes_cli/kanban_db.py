@@ -4440,6 +4440,33 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+CIRCUIT_BREAKER_BLOCK_KIND = "circuit_breaker"
+"""Payload ``kind`` marker for the ``blocked`` event emitted by the
+dispatcher's circuit breaker (``_record_task_failure``).
+
+Distinguishes an automatic retry-exhaustion block from a deliberate
+worker/operator ``block_task`` call *without* disturbing downstream
+consumers:
+
+* ``_has_sticky_block`` treats marker-carrying ``blocked`` events as
+  NON-sticky, preserving the documented auto-recovery semantics of
+  #35072 / #28712 (a breaker block must recover once its underlying
+  condition clears; only human-initiated blocks wait for an explicit
+  ``unblock_task``).
+* ``tasks.block_kind`` stays NULL on the breaker path on purpose:
+  userland escalation tooling (e.g. ``classify_rca_tier`` in
+  /opt/data/scripts/domain/escalation.py) routes retry-exhaustion
+  tickets through the ``block_kind in {None, transient}`` lane, and
+  the scheduler's ``structural_block_kinds`` list does not know this
+  value. The audit marker lives in the event payload only.
+
+Before this marker existed the breaker flipped ``status='blocked'``
+with no ``blocked`` event at all — the "orphan" class (blocked status,
+zero blocked events) that left event-keyed detection (critic lane,
+kanban-block-watcher) blind for days (post-mortem
+260822-critic-lane-orphan-blindspot, action #3)."""
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -4453,29 +4480,42 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       emits a ``"blocked"`` event row in ``task_events``.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      repeated crashes / spawn failures / timeouts.  This also emits a
+      ``"blocked"`` event (since the orphan-source fix), but the event
+      payload carries ``kind: circuit_breaker``; such blocks are meant
+      to recover automatically once the underlying conditions change
+      (e.g. parents finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
     ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    recent one is a *sticky* ``"blocked"`` (i.e. a ``blocked`` event
+    without the circuit-breaker marker — or there is such a ``blocked``
+    event and no ``"unblocked"`` event has fired since), the task is
+    sticky and ``recompute_ready`` must *not* auto-promote it.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
+    Returns ``False`` when the only ``blocked`` events carry the
+    circuit-breaker marker, or when there is no such event at all
+    (e.g. the task was set to ``status='blocked'`` by direct DB
+    manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
+        "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row or row["kind"] != "blocked":
+        return False
+    payload = row["payload"]
+    if payload:
+        try:
+            decoded = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            decoded = None
+        if isinstance(decoded, dict) and decoded.get("kind") == CIRCUIT_BREAKER_BLOCK_KIND:
+            return False
+    return True
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -9207,6 +9247,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    breaker_hook_reason: Optional[str] = None
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
@@ -9282,6 +9323,30 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            # Audit-trail parity (post-mortem 260822-critic-lane-orphan-blindspot
+            # action #3): the status flip above used to be invisible to the
+            # event stream — no ``blocked`` row, NULL ``block_kind``/reason —
+            # which stranded every event-keyed detector (critic lane,
+            # kanban-block-watcher) while stall-naggers spammed the orphan.
+            # Events are the audit trail; status is state. The payload kind
+            # marker keeps ``_has_sticky_block`` treating this as an
+            # auto-recoverable breaker block rather than a sticky human one.
+            _append_event(
+                conn, task_id, "blocked",
+                {
+                    "kind": CIRCUIT_BREAKER_BLOCK_KIND,
+                    "trigger_outcome": outcome,
+                    "failures": failures,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "error": error[:500],
+                },
+                run_id=run_id,
+            )
+            # Deferred until after the write txn commits (same convention as
+            # block_task): plugin code must never observe board state under an
+            # open SQLite write lock.
+            breaker_hook_reason = f"circuit_breaker: {outcome} x{failures}"
             blocked = True
         else:
             # Below threshold.
@@ -9322,6 +9387,18 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    if blocked and breaker_hook_reason is not None:
+        # Fire AFTER the write txn commits — mirrors block_task's convention
+        # so lifecycle plugins observe durable board state, never an open txn.
+        _blocked_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=_blocked_task.assignee if _blocked_task else None,
+            run_id=run_id,
+            reason=breaker_hook_reason,
+        )
     return blocked
 
 
