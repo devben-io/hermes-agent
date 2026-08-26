@@ -2697,6 +2697,15 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Fair cross-board ticket selection: build the UNION of all
+        # boards' spawnable ready/review tickets each tick, sort by
+        # priority then age, and claim top candidates against one shared
+        # host budget. Without this, each board consumes the entire
+        # remaining host budget in enumeration order and the LAST board
+        # is structurally starved whenever an earlier board sustains a
+        # ready backlog. Set to false to restore the legacy sequential
+        # per-board loop (rollback escape hatch).
+        "fair_selection": True,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.

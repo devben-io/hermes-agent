@@ -8082,6 +8082,12 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    corrupt: bool = False
+    """True when this board's database was found unreadable/corrupt during
+    a union tick (:func:`dispatch_once_all_boards`). The board contributed
+    no candidates and ran at most partial maintenance; the caller (gateway
+    watcher) maps this onto its corrupt-board quarantine registry so the
+    board is retried only after the file changes or the timer expires."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9805,6 +9811,343 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+_DISPATCH_READY_SQL = (
+    "SELECT id, assignee, priority, created_at FROM tasks "
+    "WHERE status = 'ready' AND claim_lock IS NULL "
+    "ORDER BY priority DESC, created_at ASC"
+)
+
+_DISPATCH_REVIEW_SQL = (
+    "SELECT id, assignee, priority, created_at FROM tasks "
+    "WHERE status = 'review' AND claim_lock IS NULL "
+    "ORDER BY priority DESC, created_at ASC"
+)
+
+
+def _is_corrupt_db_error(exc: BaseException) -> bool:
+    """Classify a SQLite 'not a database' style failure.
+
+    Mirrors the watcher-side classifier (gateway/kanban_watchers.py) so
+    the dispatcher and the quarantine bookkeeping agree on what counts as
+    a corrupt board file: either the typed :class:`KanbanDbCorruptError`
+    or a raw ``sqlite3.DatabaseError`` whose message matches the two
+    canonical corruption strings.
+    """
+    corrupt_error = globals().get("KanbanDbCorruptError")
+    if corrupt_error is not None and isinstance(exc, corrupt_error):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+    )
+
+
+@dataclass
+class _DispatchLaneState:
+    """Mutable per-tick state shared by the ready/review claim loops.
+
+    One instance drives BOTH lanes of a tick. ``spawned`` is the shared
+    budget counter (ready and review draws come out of the same budget);
+    ``per_profile_running`` is seeded from the DB(s) at tick start and
+    incremented after every spawn (real or dry-run) so later iterations
+    in the SAME tick respect ``max_in_progress_per_profile`` (#21582).
+    """
+
+    result: "DispatchResult"
+    spawned: int = 0
+    dry_run: bool = False
+    ttl_seconds: Optional[int] = None
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT
+    spawn_fn: Any = None
+    per_profile_cap: Optional[int] = None
+    per_profile_running: dict = field(default_factory=dict)
+    default_assignee: Optional[str] = None
+    default_assignee_resolved: bool = False
+
+
+def _profile_exists_safe(assignee: str) -> Optional[bool]:
+    """Resolve ``hermes_cli.profiles.profile_exists`` defensively.
+
+    Returns ``None`` when the profiles module is unavailable (test stubs,
+    exotic envs) — callers then assume spawnable, matching the historical
+    in-loop fallback behaviour.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        return None
+    return bool(profile_exists(assignee))
+
+
+def _process_ready_candidate(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    row: sqlite3.Row,
+    st: _DispatchLaneState,
+) -> None:
+    """Apply every spawnability gate to one ready row and spawn it if it
+    passes. Shared verbatim by the single-board tick
+    (:func:`_dispatch_once_locked`) and the global union tick
+    (:func:`dispatch_once_all_boards`) — one implementation, no drift.
+
+    Budget enforcement (``st.spawned`` vs the lane budget) stays with the
+    CALLER, which decides iteration order and when to stop scanning.
+    """
+    result = st.result
+    dry_run = st.dry_run
+    row_assignee = row["assignee"]
+    if not row_assignee:
+        # Honour kanban.default_assignee: when the dispatcher hits an
+        # unassigned ready task and an operator-configured fallback
+        # exists, persist the assignment and proceed. This removes the
+        # dashboard footgun where a task created without an assignee
+        # parks in 'ready' forever even though the operator's intent
+        # ("default") was perfectly clear (#27145). Mutating the row
+        # (not just the in-memory view) keeps diagnostics and the
+        # board state consistent: the task is now legitimately owned
+        # by ``kanban.default_assignee``, not "unassigned but secretly
+        # routed".
+        if st.default_assignee and st.default_assignee_resolved:
+            # Dry-run: show what WOULD happen (auto-assign + spawn) without
+            # mutating the DB. Real run: mutate the row + emit the
+            # 'assigned' event so the board state matches what just happened.
+            if not dry_run:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET assignee = ? WHERE id = ? "
+                            "AND (assignee IS NULL OR assignee = '')",
+                            (st.default_assignee, row["id"]),
+                        )
+                        _append_event(
+                            conn, row["id"], "assigned",
+                            {
+                                "assignee": st.default_assignee,
+                                "source": "kanban.default_assignee",
+                            },
+                        )
+                except Exception:
+                    _log.debug(
+                        "kanban dispatch: failed to apply default_assignee=%r "
+                        "to task %s",
+                        st.default_assignee, row["id"], exc_info=True,
+                    )
+                    result.skipped_unassigned.append(row["id"])
+                    return
+            row_assignee = st.default_assignee
+            result.auto_assigned_default.append(row["id"])
+        else:
+            result.skipped_unassigned.append(row["id"])
+            return
+    # Skip ready tasks whose assignee is not a real Hermes profile.
+    # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
+    # with "Profile 'X' does not exist" when the assignee names a
+    # control-plane lane (e.g. an interactive Claude Code terminal
+    # like ``orion-cc`` / ``orion-research``) rather than a Hermes
+    # profile. Those task lanes are pulled by terminals via
+    # ``claim_task`` directly and should NEVER auto-spawn — the
+    # subprocess would crash on startup, get reaped as a zombie,
+    # the task would loop back to ``ready`` on next tick, and we'd
+    # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
+    pe = _profile_exists_safe(row_assignee)
+    if pe is not None and not pe:
+        # Bucket separately from skipped_unassigned: the operator
+        # cannot fix this by assigning a profile (the assignee IS the
+        # intended owner — a terminal lane). Health telemetry uses
+        # this distinction to suppress spurious "stuck" warnings on
+        # multi-lane setups where the ready queue is steadily full
+        # of human-pulled work.
+        result.skipped_nonspawnable.append(row["id"])
+        return
+    # Per-profile concurrency cap (#21582): even if there's global
+    # headroom, refuse to spawn for an assignee that's already at
+    # its in-flight cap. Prevents one profile's local model / API
+    # quota / browser pool from being overwhelmed by a fan-out
+    # while the global max_in_progress / max_spawn caps still allow
+    # work on OTHER profiles.
+    if st.per_profile_cap is not None:
+        current = st.per_profile_running.get(row_assignee, 0)
+        if current >= st.per_profile_cap:
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, current)
+            )
+            return
+    # Respawn guard: refuse to re-spawn when useful work is already
+    # in-flight/recent, or when the last failure is a deterministic
+    # blocker (quota / auth). The guard defers the spawn this tick so
+    # the task gets a chance to clear (rate limits often reset in
+    # seconds-to-minutes); the existing consecutive_failures counter
+    # still trips the auto-block circuit breaker after failure_limit
+    # consecutive failures, so a persistent auth error eventually
+    # blocks via the normal path rather than on first occurrence.
+    guard_reason = check_respawn_guard(conn, row["id"])
+    if guard_reason is not None:
+        result.respawn_guarded.append((row["id"], guard_reason))
+        # Emit an event so operators can see why the task was
+        # skipped when reading `hermes kanban tail` — without
+        # this the task appears stuck in ready with no diagnosis.
+        if not dry_run:
+            with write_txn(conn):
+                _append_event(
+                    conn, row["id"], "respawn_guarded",
+                    {"reason": guard_reason},
+                )
+        return
+    if dry_run:
+        result.spawned.append((row["id"], row_assignee, ""))
+        st.spawned += 1
+        # Increment per-profile counter even in dry_run so the cap
+        # check sees the would-be spawn on subsequent iterations.
+        # Without this, dry_run reports every task as spawnable and
+        # under-reports the capped subset (#21582).
+        if st.per_profile_cap is not None and row_assignee:
+            st.per_profile_running[row_assignee] = (
+                st.per_profile_running.get(row_assignee, 0) + 1
+            )
+        return
+    claimed = claim_task(conn, row["id"], ttl_seconds=st.ttl_seconds)
+    if claimed is None:
+        return
+    _finish_claim_and_spawn(conn, board, claimed, row_assignee, st)
+
+
+def _process_review_candidate(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    row: sqlite3.Row,
+    st: _DispatchLaneState,
+) -> None:
+    """Same gate chain as :func:`_process_ready_candidate` for the review
+    column: claim via :func:`claim_review_task`, force-load the bundled
+    ``sdlc-review`` skill, spawn the reviewer. Review rows must already
+    carry an assignee (unassigned review rows are skipped upstream).
+    """
+    result = st.result
+    dry_run = st.dry_run
+    row_assignee = row["assignee"]
+    pe = _profile_exists_safe(row_assignee)
+    if pe is not None and not pe:
+        result.skipped_nonspawnable.append(row["id"])
+        return
+    if st.per_profile_cap is not None:
+        current = st.per_profile_running.get(row_assignee, 0)
+        if current >= st.per_profile_cap:
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, current)
+            )
+            return
+    guard_reason = check_respawn_guard(conn, row["id"], lane="review")
+    if guard_reason is not None:
+        result.respawn_guarded.append((row["id"], guard_reason))
+        if not dry_run:
+            with write_txn(conn):
+                _append_event(
+                    conn, row["id"], "respawn_guarded",
+                    {"reason": guard_reason},
+                )
+        return
+    if dry_run:
+        result.spawned.append((row["id"], row_assignee, ""))
+        st.spawned += 1
+        if st.per_profile_cap is not None:
+            st.per_profile_running[row_assignee] = (
+                st.per_profile_running.get(row_assignee, 0) + 1
+            )
+        return
+    claimed = claim_review_task(conn, row["id"], ttl_seconds=st.ttl_seconds)
+    if claimed is None:
+        return
+    # Force-load the sdlc-review skill for review agents — it carries
+    # the review logic (AC verification, merge, etc.). The mandatory
+    # kanban lifecycle is already injected into every worker's system
+    # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
+    # review agent needs.
+    claimed.skills = list(
+        dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
+    )
+    _finish_claim_and_spawn(conn, board, claimed, row_assignee, st)
+
+
+def _finish_claim_and_spawn(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    claimed: Any,
+    row_assignee: str,
+    st: _DispatchLaneState,
+) -> None:
+    """Post-claim tail shared by both lanes: workspace resolution, PID
+    persistence, worker-spawned hook, and spawn-failure accounting."""
+    result = st.result
+    try:
+        resolved_branch_name = None
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+        else:
+            workspace = resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn, claimed.id, f"workspace: {exc}",
+            failure_limit=st.failure_limit,
+        )
+        if auto:
+            result.auto_blocked.append(claimed.id)
+        return
+    # Persist the resolved workspace path so the worker can cd there.
+    set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+    _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    _spawn = st.spawn_fn if st.spawn_fn is not None else _default_spawn
+    try:
+        # Back-compat: older spawn_fn signatures accept only
+        # (task, workspace). Test stubs in the suite rely on that.
+        # Introspect the callable and pass `board` only when supported.
+        import inspect
+        try:
+            sig = inspect.signature(_spawn)
+            if "board" in sig.parameters:
+                pid = _spawn(claimed, str(workspace), board=board)
+            else:
+                pid = _spawn(claimed, str(workspace))
+        except (TypeError, ValueError):
+            pid = _spawn(claimed, str(workspace))
+        if pid:
+            _set_worker_pid(conn, claimed.id, int(pid))
+        # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
+        # returned and the PID (when reported) is durably persisted,
+        # per the RFC timing contract. Best-effort — can never break
+        # the dispatch loop.
+        _fire_worker_spawned_hook(
+            conn, claimed, str(workspace), pid, board=board,
+        )
+        # NOTE: we intentionally do NOT reset consecutive_failures
+        # here. A successful spawn proves the worker can start but
+        # doesn't prove the run will succeed. Under unified
+        # failure counting, resetting on spawn would let a task
+        # that keeps timing out after spawn loop forever. The
+        # counter is cleared only on successful completion (see
+        # complete_task).
+        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+        st.spawned += 1
+        # Track the new in-flight count for this profile so later
+        # iterations in this same tick respect the per-profile cap
+        # (#21582). Subsequent ticks re-query from the DB.
+        if st.per_profile_cap is not None and claimed.assignee:
+            st.per_profile_running[claimed.assignee] = (
+                st.per_profile_running.get(claimed.assignee, 0) + 1
+            )
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn, claimed.id, str(exc),
+            failure_limit=st.failure_limit,
+        )
+        if auto:
+            result.auto_blocked.append(claimed.id)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10111,190 +10454,21 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    st = _DispatchLaneState(
+        result=result,
+        dry_run=dry_run,
+        ttl_seconds=ttl_seconds,
+        failure_limit=failure_limit,
+        spawn_fn=spawn_fn,
+        per_profile_cap=_per_profile_cap,
+        per_profile_running=_per_profile_running,
+        default_assignee=_default_assignee,
+        default_assignee_resolved=_default_assignee_resolved,
+    )
     for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
+        if ready_budget is not None and st.spawned >= ready_budget:
             break
-        row_assignee = row["assignee"]
-        if not row_assignee:
-            # Honour kanban.default_assignee: when the dispatcher hits an
-            # unassigned ready task and an operator-configured fallback
-            # exists, persist the assignment and proceed. This removes the
-            # dashboard footgun where a task created without an assignee
-            # parks in 'ready' forever even though the operator's intent
-            # ("default") was perfectly clear (#27145). Mutating the row
-            # (not just the in-memory view) keeps diagnostics and the
-            # board state consistent: the task is now legitimately owned
-            # by ``kanban.default_assignee``, not "unassigned but secretly
-            # routed".
-            if _default_assignee and _default_assignee_resolved:
-                # Dry-run: show what WOULD happen (auto-assign + spawn) without
-                # mutating the DB. Real run: mutate the row + emit the
-                # 'assigned' event so the board state matches what just happened.
-                if not dry_run:
-                    try:
-                        with write_txn(conn):
-                            conn.execute(
-                                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
-                                (_default_assignee, row["id"]),
-                            )
-                            _append_event(
-                                conn, row["id"], "assigned",
-                                {
-                                    "assignee": _default_assignee,
-                                    "source": "kanban.default_assignee",
-                                },
-                            )
-                    except Exception:
-                        _log.debug(
-                            "kanban dispatch: failed to apply default_assignee=%r "
-                            "to task %s",
-                            _default_assignee, row["id"], exc_info=True,
-                        )
-                        result.skipped_unassigned.append(row["id"])
-                        continue
-                row_assignee = _default_assignee
-                result.auto_assigned_default.append(row["id"])
-            else:
-                result.skipped_unassigned.append(row["id"])
-                continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
-        # Per-profile concurrency cap (#21582): even if there's global
-        # headroom, refuse to spawn for an assignee that's already at
-        # its in-flight cap. Prevents one profile's local model / API
-        # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
-        # Respawn guard: refuse to re-spawn when useful work is already
-        # in-flight/recent, or when the last failure is a deterministic
-        # blocker (quota / auth). The guard defers the spawn this tick so
-        # the task gets a chance to clear (rate limits often reset in
-        # seconds-to-minutes); the existing consecutive_failures counter
-        # still trips the auto-block circuit breaker after failure_limit
-        # consecutive failures, so a persistent auth error eventually
-        # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
-            # Emit an event so operators can see why the task was
-            # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
-            continue
-        if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
-            spawned += 1
-            # Increment per-profile counter even in dry_run so the cap
-            # check sees the would-be spawn on subsequent iterations.
-            # Without this, dry_run reports every task as spawnable and
-            # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
-                )
-            continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
-        try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
-            # returned and the PID (when reported) is durably persisted,
-            # per the RFC timing contract. Best-effort — can never break
-            # the dispatch loop.
-            _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
-            )
-            # NOTE: we intentionally do NOT reset consecutive_failures
-            # here. A successful spawn proves the worker can start but
-            # doesn't prove the run will succeed. Under unified
-            # failure counting, resetting on spawn would let a task
-            # that keeps timing out after spawn loop forever. The
-            # counter is cleared only on successful completion (see
-            # complete_task).
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-            # Track the new in-flight count for this profile so later
-            # iterations in this same tick respect the per-profile cap
-            # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+        _process_ready_candidate(conn, board, row, st)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -10305,6 +10479,7 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
+    #
     # Auto-dispatch is enabled by default because Hermes bundles the
     # ``sdlc-review`` skill and reviewer workers can now approve, request
     # changes without block-loop accounting, or escalate a genuine blocker.
@@ -10317,104 +10492,12 @@ def _dispatch_once_locked(
     # ``spawn_budget`` — the reservation caps the ready lane, it does not
     # grant the review lane extra capacity.
     for row in review_rows:
-        if spawn_budget is not None and spawned >= spawn_budget:
+        if spawn_budget is not None and st.spawned >= spawn_budget:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row["assignee"], current)
-                )
-                continue
-        guard_reason = check_respawn_guard(conn, row["id"], lane="review")
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
-            if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
-            continue
-        if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
-            spawned += 1
-            if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
-                )
-            continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
-        try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # Worker-lifecycle observer (RFC #58548): same contract as the
-            # ready-lane fire above — after spawn + PID persistence.
-            _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
-            )
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+        _process_review_candidate(conn, board, row, st)
     return result
 
 
@@ -10424,6 +10507,466 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+@contextlib.contextmanager
+def _multi_board_dispatch_locks(
+    board_paths: "list[tuple[str, Path]]",
+):
+    """Acquire EVERY board's dispatch tick lock, all-or-nothing.
+
+    Yields ``True`` when this tick holds all requested board locks and may
+    proceed, ``False`` when ANY lock was unavailable (another dispatcher
+    holds it) — in which case no lock in the set remains held on exit.
+
+    Acquisition follows deterministic sorted resolved-path order, matching
+    the global candidate sort's ``(board_slug, ...)`` tiebreak domain, so
+    two concurrent multi-board ticks can never deadlock: locks are
+    non-blocking (``LOCK_EX | LOCK_NB``, see :func:`_dispatch_tick_lock`)
+    and always requested in the same order. This preserves the exact
+    single-writer guarantee of the per-board lock (#35240) while letting
+    one tick claim across boards atomically.
+    """
+    entered: list = []
+    try:
+        all_held = True
+        for _slug, path in sorted(board_paths, key=lambda kv: (str(kv[1]), kv[0])):
+            if not path.exists():
+                # No DB file yet (metadata-only board) → nothing to
+                # dispatch and nothing to protect; skip silently.
+                continue
+            cm = _dispatch_tick_lock(path)
+            try:
+                held = cm.__enter__()
+            except Exception:
+                # Unopenable lock file behaves like a lost race: give up
+                # the whole set this tick (retried next interval).
+                all_held = False
+                break
+            entered.append(cm)
+            if not held:
+                all_held = False
+                break
+        yield all_held
+    finally:
+        for cm in reversed(entered):
+            try:
+                cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
+def dispatch_once_all_boards(
+    board_slugs: "list[str]",
+    *,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    reconcile_orphans: bool = True,
+) -> "dict[str, DispatchResult]":
+    """Run ONE dispatcher tick across ALL boards with fair selection.
+
+    Fairness fix for structural host-cap starvation: the sequential
+    per-board loop (``dispatch_once`` called board by board) lets whichever
+    board enumerates FIRST consume the entire remaining host budget, so the
+    LAST board is structurally starved whenever an earlier board sustains a
+    ready backlog — even when that board holds older, higher-priority work.
+    Reordering the loop cannot fix this; it only moves the starvation.
+
+    This entry instead performs GLOBAL union selection:
+
+    1. Acquire every board's dispatch lock (all-or-nothing, sorted-path
+       order — see :func:`_multi_board_dispatch_locks`). Losing any lock
+       skips the whole tick with ``skipped_locked=True`` per board, exactly
+       mirroring single-board semantics when an orphan dispatcher races.
+    2. Run the unchanged per-board maintenance phases (TTL/stale/crash
+       reclaim, orphan reconciliation, max-runtime enforcement, todo→ready
+       promotion) on each board connection.
+    3. Compute the shared spawn budget ONCE against the host-wide running
+       total (sum across boards — supersedes the per-board
+       ``count_running_tasks_other_boards`` hop inside this path) and
+       sample memory pressure ONCE per tick (the per-board sampling let
+       ``elevated`` pressure admit N spawns per tick instead of 1).
+    4. Enumerate every board's ready (+ review) rows, tag each candidate
+       with its board, and globally sort by
+       ``(-priority, created_at, board_slug, task_id)`` — operator priority
+       dominates, age breaks ties, board/id make ties deterministic.
+    5. Claim top candidates against the shared budget in two phases
+       (ready lane capped at ``budget - 1`` when spawnable review work
+       exists anywhere, review lane drawing on the full budget — the same
+       reservation semantics as the single-board tick, now across boards).
+       BOTH lanes draw from ONE shared total: the review lane's cap is the
+       remaining shared budget, not a second pool — review handoff is not
+       additional capacity (#74431). Every spawnability gate (default-assignee fill, profile existence,
+       per-profile cap, respawn guard) and the atomic ``claim_task`` /
+       ``claim_review_task`` CAS run UNCHANGED via the shared helpers, so
+       caps and crash-safety semantics are byte-for-byte the single-board
+       ones; only WHERE selection happens changed. Claims never leave a
+       double-spawn window: snapshot → claim happens inside one lock hold,
+       and the claim CAS rejects already-claimed rows.
+
+    ``max_spawn`` NOTE: historically a PER-BOARD live cap (see
+    :func:`_dispatch_once_locked`); in this union path it bounds the HOST
+    alongside ``max_in_progress``. The union pool makes per-board
+    enforcement redundant (a board's remaining allowance can never fall
+    below the shared remaining budget), so no separate per-board counter
+    is tracked here — see the pool comment in the body.
+
+    Corrupt/unreadable board DBs fail soft: the affected board contributes
+    no candidates and its result records whatever maintenance completed;
+    healthy boards finish their tick. Non-corruption failures (transient
+    errors, programming bugs) drop the board for the CURRENT pass only and
+    leave ``corrupt`` unset — only classified corruption enters the
+    corrupt-board quarantine. The gateway watcher maps returned corruption
+    signals onto its quarantine registry.
+
+    Returns ``{slug: DispatchResult}`` for watcher telemetry. Tick observer
+    hooks fire per board strictly AFTER the lock set is released
+    (#56066/#64231 contract).
+    """
+    # Reap zombie children from previously spawned workers ONCE per tick
+    # (the sequential per-board loop ran this once per BOARD — N+1 per tick;
+    # see recon §2). Same rationale as the single-board tick.
+    reap_worker_zombies()
+
+    # Stable de-dup preserving caller order.
+    seen: "set[str]" = set()
+    slugs: "list[str]" = []
+    for slug in board_slugs:
+        if slug and slug not in seen:
+            seen.add(slug)
+            slugs.append(slug)
+
+    results: "dict[str, DispatchResult]" = {slug: DispatchResult() for slug in slugs}
+    board_paths: "list[tuple[str, Path]]" = []
+    for slug in slugs:
+        try:
+            board_paths.append((slug, kanban_db_path(board=slug)))
+        except Exception:
+            # Path resolution should never fail; if it does, skip the
+            # board rather than dropping the whole multi-board tick.
+            _log.warning(
+                "kanban dispatch: could not resolve DB path for board %s; "
+                "skipping it this tick",
+                slug,
+            )
+            board_paths.append((slug, Path("/nonexistent/<unresolvable>")))
+    if not board_paths:
+        return results
+
+    corrupt_seen: "dict[str, BaseException]" = {}
+    conns: "dict[str, sqlite3.Connection]" = {}
+
+    with _multi_board_dispatch_locks(board_paths) as all_held:
+        if not all_held:
+            for res in results.values():
+                res.skipped_locked = True
+        else:
+            try:
+                # ---- open connections (corruption quarantines the board) ----
+                for slug, path in board_paths:
+                    if not path.exists():
+                        continue
+                    try:
+                        conns[slug] = connect(board=slug)
+                    except Exception as exc:
+                        if _is_corrupt_db_error(exc):
+                            corrupt_seen.setdefault(slug, exc)
+                            results[slug].corrupt = True
+                        else:
+                            _log.exception(
+                                "kanban dispatch: failed to open board %s",
+                                slug,
+                            )
+
+                def _drop_corrupt(slug: str, exc: BaseException) -> None:
+                    corrupt_seen.setdefault(slug, exc)
+                    results[slug].corrupt = True
+                    conn = conns.pop(slug, None)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                def _drop_board(slug: str) -> None:
+                    """Drop a board from the CURRENT union pass only.
+
+                    For non-corruption failures (transient errors, programming
+                    bugs in a maintenance call, busy/locked SQLite states):
+                    the board contributes no candidates this tick and is
+                    retried naturally on the next tick. It must NOT set
+                    ``DispatchResult.corrupt`` — the watcher maps that flag to
+                    the durable corrupt-board quarantine (fingerprint pause
+                    window), and quarantining on an ordinary exception would
+                    suppress dispatch on a healthy DB until the fingerprint
+                    changes or the timer expires. Mirrors the legacy
+                    single-board tick, where non-corrupt exceptions are
+                    logged and retried, never quarantined.
+                    """
+                    conn = conns.pop(slug, None)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                # ---- per-board maintenance (unchanged semantics) ----
+                for slug in list(conns.keys()):
+                    conn = conns[slug]
+                    res = results[slug]
+                    try:
+                        res.reclaimed = release_stale_claims(conn)
+                        if reconcile_orphans:
+                            res.reconciled_orphans = reconcile_orphaned_running(conn)
+                        res.stale = detect_stale_running(
+                            conn, stale_timeout_seconds=stale_timeout_seconds,
+                        )
+                        res.crashed = detect_crashed_workers(conn)
+                        _crash_auto_blocked = getattr(
+                            detect_crashed_workers, "_last_auto_blocked", []
+                        )
+                        if _crash_auto_blocked:
+                            res.auto_blocked.extend(_crash_auto_blocked)
+                        _crash_rate_limited = getattr(
+                            detect_crashed_workers, "_last_rate_limited", []
+                        )
+                        if _crash_rate_limited:
+                            res.rate_limited.extend(_crash_rate_limited)
+                        res.timed_out = enforce_max_runtime(conn)
+                        res.promoted = recompute_ready(
+                            conn, failure_limit=failure_limit,
+                        )
+                    except Exception as exc:
+                        if _is_corrupt_db_error(exc):
+                            _drop_corrupt(slug, exc)
+                        else:
+                            # One board's transient failure must not stall
+                            # the others (same fail-open stance as
+                            # count_running_tasks_other_boards). Drop the
+                            # board for THIS pass only — corrupt=False: the
+                            # watcher must not quarantine a healthy DB.
+                            _log.exception(
+                                "kanban dispatch: maintenance failed on board %s",
+                                slug,
+                            )
+                            _drop_board(slug)
+
+                # ---- shared budget computed ONCE across the union ----
+                spawn_budget: Optional[int] = None
+                if max_spawn is not None or max_in_progress is not None:
+                    running_total = sum(
+                        count_running_tasks(c) for c in conns.values()
+                    )
+                    if max_spawn is not None:
+                        # Host-wide bound in the union path; the per-board
+                        # dimension is enforced per candidate below.
+                        if running_total < max_spawn:
+                            spawn_budget = max_spawn - running_total
+                        else:
+                            spawn_budget = 0
+                    if max_in_progress is not None:
+                        if running_total >= max_in_progress:
+                            spawn_budget = 0
+                        else:
+                            remaining = max_in_progress - running_total
+                            if spawn_budget is None or spawn_budget > remaining:
+                                spawn_budget = remaining
+
+                # Memory-pressure guard, sampled ONCE per tick (fixes the
+                # per-board sampling that admitted N spawns under elevated
+                # pressure). Same classification + logging contract as the
+                # single-board tick.
+                pressure = _memory_pressure_level()
+                if pressure == "critical":
+                    for res in results.values():
+                        res.memory_pressure = pressure
+                    _log.warning(
+                        "kanban dispatch: system memory pressure is critical; "
+                        "spawning no new workers this tick (deferred, not dropped)"
+                    )
+                    spawn_budget = 0
+                elif pressure == "elevated":
+                    for res in results.values():
+                        res.memory_pressure = pressure
+                    if spawn_budget is None or spawn_budget > 1:
+                        _log.warning(
+                            "kanban dispatch: system memory pressure is elevated; "
+                            "limiting to at most 1 new worker this tick"
+                        )
+                        spawn_budget = 1
+                # ---- global candidate pool ----
+                # NOTE on max_spawn: historically a PER-BOARD live cap (see
+                # _dispatch_once_locked). In this union path it is promoted
+                # to a HOST-wide live cap alongside max_in_progress — the
+                # union pool makes per-board enforcement redundant: a
+                # board's remaining allowance (max_spawn − own_running −
+                # claimed_here) can never fall below the shared remaining
+                # budget while other boards draw from the same pool, so a
+                # separate per-board counter adds dead state without ever
+                # changing an outcome.
+                pool: "list[tuple[int, int, str, str, str, sqlite3.Row]]" = []
+                # (lane_rank, -priority, created_at, board_slug, task_id, row)
+                review_dispatch_on = review_dispatch_enabled()
+                if spawn_budget != 0:
+                    for slug in list(conns.keys()):
+                        conn = conns[slug]
+                        res = results[slug]
+                        try:
+                            for row in conn.execute(_DISPATCH_READY_SQL):
+                                pool.append((0, -int(row["priority"] or 0),
+                                             int(row["created_at"] or 0),
+                                             slug, str(row["id"]), row))
+                            if review_dispatch_on:
+                                for row in conn.execute(_DISPATCH_REVIEW_SQL):
+                                    pool.append((1, -int(row["priority"] or 0),
+                                                 int(row["created_at"] or 0),
+                                                 slug, str(row["id"]), row))
+                        except Exception as exc:
+                            if _is_corrupt_db_error(exc):
+                                _drop_corrupt(slug, exc)
+                            else:
+                                _log.exception(
+                                    "kanban dispatch: candidate scan failed on board %s",
+                                    slug,
+                                )
+                                _drop_board(slug)
+                    pool.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4]))
+
+                # Review-lane reservation across boards: if ANY board holds
+                # spawnable review work, the ready lane gets budget - 1.
+                def _any_spawnable_review() -> bool:
+                    for cand in pool:
+                        if cand[0] != 1:
+                            continue
+                        assignee = cand[5]["assignee"]
+                        if not assignee:
+                            continue
+                        pe = _profile_exists_safe(assignee)
+                        if pe is None or pe:
+                            return True
+                    return False
+
+                ready_budget = spawn_budget
+                if (
+                    spawn_budget is not None
+                    and spawn_budget > 0
+                    and _any_spawnable_review()
+                ):
+                    ready_budget = max(spawn_budget - 1, 0)
+
+                st = _DispatchLaneState(
+                    result=None,  # set per candidate below
+                    dry_run=dry_run,
+                    ttl_seconds=ttl_seconds,
+                    failure_limit=failure_limit,
+                    spawn_fn=spawn_fn,
+                    per_profile_cap=max_in_progress_per_profile if (
+                        isinstance(max_in_progress_per_profile, int)
+                        and max_in_progress_per_profile > 0
+                    ) else None,
+                    default_assignee=(default_assignee or "").strip() or None,
+                )
+                if st.per_profile_cap is not None:
+                    # Seed per-profile counters from a UNION of every
+                    # board's running rows (host-wide view of the cap).
+                    for conn in conns.values():
+                        for prow in conn.execute(
+                            "SELECT assignee, COUNT(*) AS n FROM tasks "
+                            "WHERE status = 'running' AND assignee IS NOT NULL "
+                            "GROUP BY assignee"
+                        ):
+                            st.per_profile_running[prow["assignee"]] = (
+                                st.per_profile_running.get(prow["assignee"], 0)
+                                + int(prow["n"])
+                            )
+                if st.default_assignee:
+                    try:
+                        from hermes_cli.profiles import profile_exists as _pe
+                        st.default_assignee_resolved = bool(_pe(st.default_assignee))
+                    except Exception:
+                        # Profiles module not importable (test stubs, exotic
+                        # envs): trust the operator's config, matching the
+                        # single-board tick's fallback.
+                        st.default_assignee_resolved = True
+
+                claimed_from: "dict[str, int]" = {}
+                # ONE shared spawn counter drives both lanes — the same
+                # invariant as the single-board tick, where the ready loop
+                # checks ``st.spawned >= ready_budget`` and the review loop
+                # checks ``st.spawned >= spawn_budget`` against the SAME
+                # total. Tracking per-lane counters instead would let the
+                # review lane admit ``spawn_budget`` reviews ON TOP of the
+                # ready lane's ``ready_budget`` reads (budget 2 → 1 ready +
+                # 2 reviews = 3 workers), breaching max_in_progress /
+                # max_spawn exactly at the admission boundary they exist to
+                # guard. The reservation (ready_budget = spawn_budget - 1)
+                # still guarantees the review lane its slot: once the total
+                # hits spawn_budget the loop breaks, and until then the
+                # ready lane alone cannot consume the reserved slot.
+                _total_spawned = 0
+                for lane_rank, neg_prio, created_at, slug, tid, row in pool:
+                    res = results[slug]
+                    if slug not in conns:
+                        continue  # board died mid-pass (quarantined)
+                    if spawn_budget is not None and _total_spawned >= spawn_budget:
+                        break
+                    if lane_rank == 0:
+                        if ready_budget is not None and _total_spawned >= ready_budget:
+                            continue
+                    else:
+                        if not row["assignee"]:
+                            res.skipped_unassigned.append(row["id"])
+                            continue
+                    conn = conns[slug]
+                    st.result = res
+                    before = len(res.spawned)
+                    try:
+                        if lane_rank == 0:
+                            _process_ready_candidate(conn, slug, row, st)
+                        else:
+                            _process_review_candidate(conn, slug, row, st)
+                    except Exception as exc:
+                        if _is_corrupt_db_error(exc):
+                            _drop_corrupt(slug, exc)
+                            continue
+                        # A single bad candidate must not kill the pass.
+                        _log.exception(
+                            "kanban dispatch: candidate %s/%s failed",
+                            slug, row["id"],
+                        )
+                        continue
+                    if len(res.spawned) > before:
+                        claimed_from[slug] = claimed_from.get(slug, 0) + 1
+                        _total_spawned += 1
+
+                # Periodic PASSIVE WAL checkpoints under the lock set,
+                # mirroring dispatch_once's post-tick checkpoint.
+                for slug, conn in list(conns.items()):
+                    try:
+                        path = kanban_db_path(board=slug)
+                        _maybe_checkpoint_wal(conn, path)
+                    except Exception:
+                        pass
+            finally:
+                for conn in conns.values():
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    # Tick observers fire strictly OUTSIDE the critical section, per board
+    # (#56066 sweeper finding / #64231 disposition) — same contract as
+    # dispatch_once.
+    for slug in slugs:
+        _fire_dispatch_tick_hook(results[slug], board=slug, dry_run=dry_run)
+    return results
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:

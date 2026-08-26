@@ -1452,16 +1452,15 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
-            """Run one dispatch_once for a specific board.
+        def _board_quarantined(slug: str) -> bool:
+            """True while the board DB stays quarantined as corrupt.
 
-            Runs in a worker thread via `asyncio.to_thread`. `board=slug`
-            is passed through `dispatch_once` so `resolve_workspace` and
-            `_default_spawn` see the right paths. The per-board DB is
-            opened explicitly so concurrent boards never share a
-            connection handle or accidentally claim across each other.
+            Fingerprint + timer bookkeeping shared by BOTH dispatch paths
+            (legacy single-board loop and the global union pass): an entry
+            blocks dispatch until the file changes, the gateway restarts,
+            or CORRUPT_BOARD_RETRY_AFTER_SECONDS elapses. Expired/changed
+            entries are popped here so the next attempt retries the board.
             """
-            conn = None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
             if disabled_entry is not None:
@@ -1471,7 +1470,7 @@ class GatewayKanbanWatchersMixin:
                     disabled_fingerprint == fingerprint
                     and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
                 ):
-                    return None
+                    return True
                 if disabled_fingerprint == fingerprint:
                     logger.info(
                         "kanban dispatcher: board %s database fingerprint unchanged "
@@ -1485,6 +1484,34 @@ class GatewayKanbanWatchersMixin:
                         slug,
                     )
                 disabled_corrupt_boards.pop(slug, None)
+            return False
+
+        def _quarantine_board(slug: str) -> None:
+            """Mark the board's DB corrupt: fingerprint-stamped pause window."""
+            fingerprint = _board_db_fingerprint(slug)
+            disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+            logger.error(
+                "kanban dispatcher: board %s database %s is not a valid "
+                "SQLite database; pausing dispatch for this board until "
+                "the file changes, the gateway restarts, or the "
+                "quarantine timer expires. Move or restore the file, "
+                "then run `hermes kanban init` if you need a fresh board.",
+                slug,
+                fingerprint[0],
+            )
+
+        def _tick_once_for_board(slug: str) -> "Optional[object]":
+            """Legacy single-board dispatch_once (fair_selection off).
+
+            Runs in a worker thread via `asyncio.to_thread`. `board=slug`
+            is passed through `dispatch_once` so `resolve_workspace` and
+            `_default_spawn` see the right paths. The per-board DB is
+            opened explicitly so concurrent boards never share a
+            connection handle or accidentally claim across each other.
+            """
+            conn = None
+            if _board_quarantined(slug):
+                return None
             try:
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
@@ -1506,31 +1533,13 @@ class GatewayKanbanWatchersMixin:
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _quarantine_board(slug)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _quarantine_board(slug)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
@@ -1542,21 +1551,72 @@ class GatewayKanbanWatchersMixin:
                         pass
 
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
-            """Run one dispatch_once per board. Returns (slug, result) pairs.
+            """Run one dispatcher tick across all boards.
 
             Enumerating boards on every tick keeps the dispatcher honest
             when users create a new board mid-run: no restart required,
             the next tick picks it up automatically.
+
+            Selection model — ``kanban.fair_selection`` (default True):
+
+            * True  → ONE global union tick: every board's spawnable
+              ready/review candidates compete in a single priority-then-age
+              ordering against one shared host budget
+              (:func:`_kb.dispatch_once_all_boards`). This removes the
+              structural starvation where the first board in enumeration
+              order consumed the whole host budget and the last board
+              starved (reordering alone cannot fix that).
+            * False → legacy sequential loop: a full-budget dispatch_once
+              per board in enumeration order (rollback escape hatch).
+
+            Returns (slug, result) pairs either way so telemetry/logging is
+            unchanged.
             """
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
-            return out
+            board_slugs = [b.get("slug") or _kb.DEFAULT_BOARD for b in boards]
+            fair = _fair_selection_enabled()
+            if not fair:
+                out: "list[tuple[str, Optional[object]]]" = []
+                for slug in board_slugs:
+                    out.append((slug, _tick_once_for_board(slug)))
+                return out
+            # Global union pass: exclude quarantined corrupt boards up
+            # front; corruption discovered DURING the pass comes back on
+            # the per-board DispatchResult.corrupt flag and is quarantined
+            # here for subsequent ticks.
+            active = [
+                slug for slug in board_slugs if not _board_quarantined(slug)
+            ]
+            results_map: "dict[str, object]" = {}
+            try:
+                results_map = dict(
+                    _kb.dispatch_once_all_boards(
+                        active,
+                        spawn_fn=None,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                        reconcile_orphans=reconcile_orphans,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "kanban dispatcher: union dispatch tick failed"
+                )
+            finally:
+                for slug, res in results_map.items():
+                    if res is not None and getattr(res, "corrupt", False):
+                        _quarantine_board(slug)
+            return [
+                (slug, results_map.get(slug))
+                for slug in board_slugs
+            ]
 
         def _ready_nonempty() -> bool:
             """Cheap probe: is there at least one ready+assigned+unclaimed
@@ -1615,6 +1675,20 @@ class GatewayKanbanWatchersMixin:
         # auto-decompose created and launched destructive tasks while the user
         # was still typing the task description, and the flag "couldn't be
         # disabled" because the gateway had captured its boot-time value.)
+        def _fair_selection_enabled() -> bool:
+            """Re-resolve kanban.fair_selection from current config each tick.
+
+            Read live (like auto_decompose) so an operator flipping
+            fair_selection=false to roll back to the legacy sequential
+            per-board loop takes effect on the next tick, without a gateway
+            restart.
+            """
+            try:
+                cfg = _load_config()
+                return bool((cfg or {}).get("kanban", {}).get("fair_selection", True))
+            except Exception:
+                return True
+
         def _read_auto_decompose_settings() -> tuple[bool, int]:
             """Re-resolve (enabled, per_tick) from current config each tick."""
             return _resolve_auto_decompose_settings(_load_config)
